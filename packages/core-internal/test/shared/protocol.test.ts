@@ -1252,3 +1252,59 @@ describe('inbound protocol-version mismatch (−32022): the error data lists eve
         await protocol.close();
     });
 });
+
+describe('progress notifications for a completed request', () => {
+    const flush = () => new Promise(resolve => setTimeout(resolve, 10));
+
+    test('a late progress notification is ignored instead of reported as a protocol error', async () => {
+        const transport = new MockTransport();
+        const protocol = createTestProtocol();
+        const errors: Error[] = [];
+        protocol.onerror = error => void errors.push(error);
+        await protocol.connect(transport);
+
+        const resultSchema: ZodType<{ result: string }> = z.object({ result: z.string() });
+        const onProgressMock = vi.fn();
+        const requestPromise = testRequest(protocol, { method: 'example', params: {} }, resultSchema, {
+            timeout: 1000,
+            onprogress: onProgressMock
+        });
+
+        // A server's terminal `progress === total` frame and its result are
+        // adjacent writes. When both land in one transport read the response is
+        // dispatched first, so the progress notification arrives for an id
+        // whose handler has already been torn down. Servers cannot avoid this
+        // race, so it must not surface as a protocol error.
+        transport.onmessage?.({ jsonrpc: '2.0', id: 0, result: { result: 'done' } });
+        transport.onmessage?.({
+            jsonrpc: '2.0',
+            method: 'notifications/progress',
+            params: { progressToken: 0, progress: 1, total: 1 }
+        });
+
+        await expect(requestPromise).resolves.toEqual({ result: 'done' });
+        await flush();
+
+        // Late progress is moot once the request completed, and no handler ran.
+        expect(onProgressMock).not.toHaveBeenCalled();
+        expect(errors).toEqual([]);
+    });
+
+    test('progress for a token that was never issued still reports a protocol error', async () => {
+        const transport = new MockTransport();
+        const protocol = createTestProtocol();
+        const errors: Error[] = [];
+        protocol.onerror = error => void errors.push(error);
+        await protocol.connect(transport);
+
+        transport.onmessage?.({
+            jsonrpc: '2.0',
+            method: 'notifications/progress',
+            params: { progressToken: 999, progress: 1, total: 1 }
+        });
+        await flush();
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0]?.message).toContain('unknown token');
+    });
+});

@@ -313,6 +313,17 @@ export function requestStateAccessor(value: unknown): RequestStateAccessor {
 const NO_REQUEST_STATE = requestStateAccessor(undefined);
 
 /**
+ * Upper bound on retained recently-completed progress tokens. Progress
+ * notifications are dispatched on a microtask while responses are handled
+ * synchronously, so a terminal `progress === total` notification written
+ * immediately before its result can be handled *after* the response under
+ * load. Remembering a small bounded window of completed tokens keeps that
+ * benign race out of `onerror` without letting a long-lived client grow the
+ * bookkeeping without limit.
+ */
+const MAX_RECENTLY_COMPLETED_PROGRESS_TOKENS = 64;
+
+/**
  * Returns a context whose `requestState` accessor reads the given value —
  * how the server seam hands a verify hook's decoded payload (or the legacy
  * shim's per-round echo) to the handler without mutating the original
@@ -572,6 +583,10 @@ export abstract class Protocol<ContextT extends BaseContext> {
     private _notificationHandlers: Map<string, (notification: JSONRPCNotification, codec: WireCodec) => Promise<void>> = new Map();
     private _responseHandlers: Map<number, (response: JSONRPCResultResponse | Error) => void> = new Map();
     private _progressHandlers: Map<number, ProgressCallback> = new Map();
+    /** Recently completed progress-enabled request ids, oldest first (bounded by {@linkcode MAX_RECENTLY_COMPLETED_PROGRESS_TOKENS}). */
+    private _completedProgressTokenQueue: number[] = [];
+    /** Membership view of {@linkcode _completedProgressTokenQueue}, used to drop late progress without an error. */
+    private _recentlyCompletedProgressTokens = new Set<number>();
     private _timeoutInfo: Map<number, TimeoutInfo> = new Map();
     private _pendingDebouncedNotifications = new Set<string>();
 
@@ -837,6 +852,8 @@ export abstract class Protocol<ContextT extends BaseContext> {
         const responseHandlers = this._responseHandlers;
         this._responseHandlers = new Map();
         this._progressHandlers.clear();
+        this._completedProgressTokenQueue = [];
+        this._recentlyCompletedProgressTokens.clear();
         this._pendingDebouncedNotifications.clear();
 
         for (const info of this._timeoutInfo.values()) {
@@ -1181,6 +1198,13 @@ export abstract class Protocol<ContextT extends BaseContext> {
 
         const handler = this._progressHandlers.get(messageId);
         if (!handler) {
+            // A token whose request completed moments ago is the benign
+            // terminal-progress race, not a protocol violation: the server has
+            // no way to order its final notification before its result once
+            // both are in flight. Drop it silently.
+            if (this._recentlyCompletedProgressTokens.has(messageId)) {
+                return;
+            }
             this._onerror(new Error(`Received a progress notification for an unknown token: ${JSON.stringify(notification)}`));
             return;
         }
@@ -1221,13 +1245,33 @@ export abstract class Protocol<ContextT extends BaseContext> {
 
         this._responseHandlers.delete(messageId);
         this._cleanupTimeout(messageId);
-        this._progressHandlers.delete(messageId);
+        if (this._progressHandlers.delete(messageId)) {
+            this._rememberCompletedProgressToken(messageId);
+        }
 
         if (isJSONRPCResultResponse(response)) {
             handler(response);
         } else {
             const error = ProtocolError.fromError(response.error.code, response.error.message, response.error.data);
             handler(error);
+        }
+    }
+
+    /**
+     * Retains a completed progress-enabled request id so a notification that
+     * lost the race against its response is discarded quietly instead of being
+     * reported as an unknown token. The window is a bounded FIFO: request ids
+     * are never reused, so eviction can only cause a genuinely old late
+     * notification to be reported again.
+     */
+    private _rememberCompletedProgressToken(messageId: number): void {
+        this._recentlyCompletedProgressTokens.add(messageId);
+        this._completedProgressTokenQueue.push(messageId);
+        while (this._completedProgressTokenQueue.length > MAX_RECENTLY_COMPLETED_PROGRESS_TOKENS) {
+            const evicted = this._completedProgressTokenQueue.shift();
+            if (evicted !== undefined) {
+                this._recentlyCompletedProgressTokens.delete(evicted);
+            }
         }
     }
 
